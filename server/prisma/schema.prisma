@@ -1,0 +1,196 @@
+// 银行柜面现金长短款复核与缴回系统 —— 数据模型
+// 说明：SQLite 不支持 Prisma enum，状态字段一律用 String，取值见 src/domain/constants.ts
+// 金额一律以「分」为单位的整数（Int），杜绝浮点误差。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- 用户与角色 ----------
+// role: TELLER(柜员) | SUPERVISOR(主管) | FINANCE(财务)
+model User {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  name      String
+  role      String
+  createdAt DateTime @default(now())
+
+  cashBoxes CashBox[]
+}
+
+// ---------- 营业日 ----------
+// status: OPEN | CLOSED
+model BusinessDay {
+  id         String    @id @default(cuid())
+  date       String    @unique // YYYY-MM-DD
+  status     String    @default("OPEN")
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  closedById String?
+
+  closings       ClosingSession[]
+  discrepancies  Discrepancy[]  @relation("AttributionDay")
+  adjustments    Adjustment[]
+  ledgerEntries  LedgerEntry[]
+}
+
+// ---------- 现金箱 ----------
+model CashBox {
+  id       String @id @default(cuid())
+  code     String @unique
+  name     String
+  tellerId String
+  teller   User   @relation(fields: [tellerId], references: [id])
+
+  denoms   CashBoxDenom[]
+  closings ClosingSession[]
+}
+
+// 现金箱「应有」面额基线（结柜时快照到 DenomCount.expectedQty）
+model CashBoxDenom {
+  id         String  @id @default(cuid())
+  cashBoxId  String
+  cashBox    CashBox @relation(fields: [cashBoxId], references: [id])
+  denomCents Int
+  qty        Int
+
+  @@unique([cashBoxId, denomCents])
+}
+
+// ---------- 结柜单 ----------
+// status: DRAFT | SUBMITTED | RECOUNT_REQUIRED | REVIEWED | VOID
+// 同一现金箱同一营业日只允许一张结柜单 —— 并发/重复结柜在此被数据库约束拦截，
+// 需要修正时走 Adjustment（调整记录），不得另开新单。
+model ClosingSession {
+  id             String   @id @default(cuid())
+  sessionNo      String   @unique
+  businessDayId  String
+  businessDay    BusinessDay @relation(fields: [businessDayId], references: [id])
+  cashBoxId      String
+  cashBox        CashBox  @relation(fields: [cashBoxId], references: [id])
+  tellerId       String
+  status         String   @default("DRAFT")
+
+  expectedCents  Int      @default(0) // 应有合计（分）
+  manualCents    Int      @default(0) // 手工实盘合计（分）
+  machineCents   Int? // 点钞机合计（分），未导入为 null
+  machineMismatch Boolean @default(false) // 机点与手点不一致 → 提示复核，不自动采信任何一方
+  diffCents      Int      @default(0) // 提交时定格：manual - expected，>0 长款，<0 短款
+
+  submittedAt    DateTime?
+  reviewedAt     DateTime?
+  reviewerId     String?
+  reviewNote     String?
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  counts         DenomCount[]
+  discrepancy    Discrepancy?
+  adjustments    Adjustment[]
+
+  @@unique([cashBoxId, businessDayId])
+  @@index([businessDayId, status])
+}
+
+// 按面额的盘点行：应有数量 / 实盘数量（手工）/ 点钞机数量
+model DenomCount {
+  id          String         @id @default(cuid())
+  closingId   String
+  closing     ClosingSession @relation(fields: [closingId], references: [id])
+  denomCents  Int
+  expectedQty Int
+  manualQty   Int            @default(0)
+  machineQty  Int?
+
+  @@unique([closingId, denomCents])
+}
+
+// ---------- 长短款 ----------
+// type: OVER(长款) | SHORT(短款)
+// status: PENDING_CLAIM(待认领) | CLAIMED(已认领) |
+//         PENDING_RECOVERY(待缴回) | RECOVERED(已缴回) | RESPONSIBILITY_FILED(已填责任说明)
+// attributionDayId = 差额归属营业日（跨日处理时不变）；adjustments/ledger 落在处理当日。
+model Discrepancy {
+  id                String  @id @default(cuid())
+  closingId         String  @unique
+  closing           ClosingSession @relation(fields: [closingId], references: [id])
+  cashBoxId         String
+  tellerId          String
+  type              String
+  amountCents       Int // 差额总额（分），正数
+  outstandingCents  Int // 尚未认领/缴回的余额（分）
+  confirmedCents    Int     @default(0) // 财务回执已确认的金额（分）
+  status            String
+  responsibilityNote String?
+  financeAckedAt    DateTime? // 财务已确认该未处理事项（允许日结挂账）
+  attributionDayId  String
+  attributionDay    BusinessDay @relation("AttributionDay", fields: [attributionDayId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  adjustments Adjustment[]
+  receipts    FinanceReceipt[]
+}
+
+// ---------- 调整记录（只增不改，原始记录永久可查） ----------
+// type: RECOUNT_CORRECTION(重复结柜修正) | HANDOVER(跨班交接) | CASH_FOUND(事后找到现金)
+//       | CLAIM_PAYOUT(长款认领付出) | RECOVERY_PAYMENT(短款缴回) | RESPONSIBILITY_NOTE(责任说明)
+model Adjustment {
+  id                String   @id @default(cuid())
+  adjustmentNo      String   @unique
+  type              String
+  closingId         String?
+  closing           ClosingSession? @relation(fields: [closingId], references: [id])
+  discrepancyId     String?
+  discrepancy       Discrepancy? @relation(fields: [discrepancyId], references: [id])
+  cashBoxId         String?
+  amountCents       Int      @default(0) // 对未了余额的影响（负=减少）
+  outstandingBefore Int      @default(0) // 调整前余额快照 —— 保证「调整前后账目一致」可核对
+  outstandingAfter  Int      @default(0) // 调整后余额快照
+  note              String?
+  payload           String? // JSON：修正前后面额、交接双方等原始数据
+  operatorId        String
+  postedDayId       String // 入账营业日（可与归属日不同 → 跨日）
+  postedDay         BusinessDay @relation(fields: [postedDayId], references: [id])
+  createdAt         DateTime @default(now())
+
+  @@index([closingId])
+  @@index([discrepancyId])
+}
+
+// ---------- 财务回执（幂等） ----------
+// receiptNo 唯一：重复回执直接返回原记录，绝不再次冲销。
+// status: APPLIED | DUPLICATE
+model FinanceReceipt {
+  id            String   @id @default(cuid())
+  receiptNo     String   @unique
+  discrepancyId String
+  discrepancy   Discrepancy @relation(fields: [discrepancyId], references: [id])
+  amountCents   Int
+  status        String   @default("APPLIED")
+  createdAt     DateTime @default(now())
+}
+
+// ---------- 台账（每笔分录配平：同批合计为 0） ----------
+// account: CASH:{现金箱code} | OVER_SUSPENSE(长款待认领) | SHORT_RECEIVABLE(短款应收) | FINANCE_VAULT(财务金库)
+model LedgerEntry {
+  id            String   @id @default(cuid())
+  businessDayId String
+  businessDay   BusinessDay @relation(fields: [businessDayId], references: [id])
+  account       String
+  amountCents   Int // 有符号：正=该账户增加，负=减少
+  refType       String // CLOSING_REVIEW | ADJUSTMENT | FINANCE_RECEIPT
+  refId         String
+  memo          String?
+  createdAt     DateTime @default(now())
+
+  @@index([account])
+  @@index([refType, refId])
+}

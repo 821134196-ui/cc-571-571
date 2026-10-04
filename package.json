@@ -1,0 +1,20 @@
+{
+  "name": "bank-teller-cash-review",
+  "version": "1.0.0",
+  "private": true,
+  "description": "银行柜面现金长短款复核与缴回系统（NestJS + Prisma + SQLite + React）",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "prestart": "node scripts/ensure-setup.mjs",
+    "start": "concurrently -k -n server,web -c blue,green \"npm run start:dev -w server\" \"npm run dev -w web\"",
+    "dev": "npm start",
+    "seed": "npm run seed -w server",
+    "test": "npm run test:e2e -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
