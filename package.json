@@ -1,0 +1,15 @@
+{
+  "name": "cash-review-system",
+  "private": true,
+  "version": "1.0.0",
+  "description": "银行柜面现金长短款复核与缴回系统",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix web install && npm --prefix server run prisma:setup",
+    "dev": "concurrently -n server,web -c blue,green \"npm --prefix server run dev\" \"npm --prefix web run dev\"",
+    "start": "npm run dev",
+    "test": "npm --prefix server test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

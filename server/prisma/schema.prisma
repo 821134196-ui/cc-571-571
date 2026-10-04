@@ -1,0 +1,183 @@
+// 银行柜面现金长短款复核与缴回系统 — 数据模型
+// 金额一律以“分”为单位的整数存储，避免浮点误差。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  TELLER
+  SUPERVISOR
+  FINANCE
+}
+
+enum DayStatus {
+  OPEN
+  CLOSED
+}
+
+enum ClosingStatus {
+  SUBMITTED // 已提交，待复核
+  REJECTED  // 复核退回
+  REVIEWED  // 复核通过，已生成处置单
+  SETTLED   // 全部处置完成
+}
+
+enum ReviewDecision {
+  APPROVE
+  REJECT
+}
+
+enum AdjustmentType {
+  CORRECTION // 盘点修正（机器/手工不一致后的确认、重复盘点更正）
+  HANDOVER   // 跨班交接差异
+  FOUND_CASH // 事后找到现金
+}
+
+enum DispositionKind {
+  OVERAGE_CLAIM       // 长款：待认领
+  SHORTAGE_PAYBACK    // 短款：缴回
+  SHORTAGE_STATEMENT  // 短款：责任说明
+}
+
+enum DispositionStatus {
+  PENDING
+  CONFIRMED
+  REVERSED
+  CANCELLED // 被后续调整合并取消（保留审计痕迹）
+}
+
+enum ReceiptAction {
+  CONFIRM
+  REVERSAL
+}
+
+enum LedgerKind {
+  CLOSING_DIFF // 复核确认的结柜差额（正=长款，负=短款）
+  ADJUSTMENT   // 调整记录（修正/交接/找到现金）
+  PAYBACK      // 短款缴回入账
+  CLAIM_OUT    // 长款认领出账
+  STATEMENT    // 短款责任说明挂账（应收柜员）
+  REVERSAL     // 财务冲销
+}
+
+model User {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  name      String
+  role      Role
+  closings  CashClosing[]
+  reviews   Review[]
+  createdAt DateTime @default(now())
+}
+
+model BusinessDay {
+  id        String       @id @default(cuid())
+  date      String       @unique // YYYY-MM-DD
+  status    DayStatus    @default(OPEN)
+  openedAt  DateTime     @default(now())
+  closedAt  DateTime?
+  closings  CashClosing[]
+  ledger    LedgerEntry[]
+}
+
+model CashClosing {
+  id            String        @id @default(cuid())
+  businessDayId String
+  businessDay   BusinessDay   @relation(fields: [businessDayId], references: [id])
+  tellerId      String
+  teller        User          @relation(fields: [tellerId], references: [id])
+  shift         String // MORNING / EVENING —— 同一柜员同一营业日同一班次只允许一张结柜单
+  status        ClosingStatus @default(SUBMITTED)
+  expectedCents Int
+  actualCents   Int
+  diffCents     Int // actual - expected；正=长款，负=短款
+  countConflict Boolean       @default(false) // 机器点钞与手工盘点不一致，需复核确认
+  lines         DenomLine[]
+  reviews       Review[]
+  adjustments   Adjustment[]
+  dispositions  Disposition[]
+  ledgerEntries LedgerEntry[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@unique([businessDayId, tellerId, shift])
+}
+
+model DenomLine {
+  id          String      @id @default(cuid())
+  closingId   String
+  closing     CashClosing @relation(fields: [closingId], references: [id])
+  denomCents  Int // 面额（分）
+  expectedQty Int // 应有数量（账面）
+  manualQty   Int // 手工盘点数量
+  machineQty  Int? // 点钞机数量（可空）
+  finalQty    Int // 确认数量：默认=手工，修正调整可改
+}
+
+model Review {
+  id         String         @id @default(cuid())
+  closingId  String // 一张结柜单可有多条复核记录（退回→修正→复复核）；并发由结柜单状态守卫保证只推进一次
+  closing    CashClosing    @relation(fields: [closingId], references: [id])
+  reviewerId String
+  reviewer   User           @relation(fields: [reviewerId], references: [id])
+  decision   ReviewDecision
+  comment    String?
+  createdAt  DateTime       @default(now())
+
+  @@index([closingId])
+}
+
+model Adjustment {
+  id                  String         @id @default(cuid())
+  closingId           String
+  closing             CashClosing    @relation(fields: [closingId], references: [id])
+  type                AdjustmentType
+  originBusinessDayId String // 差额归属营业日（跨日保留归属）
+  createdBusinessDayId String // 实际录入的营业日
+  note                String?
+  deltaCents          Int // 对未解决差额的修正量（正=补回现金/核销长款，负=反向）
+  linesJson           String? // 修正时的面额明细快照（原始记录，可追溯）
+  createdById         String
+  createdAt           DateTime       @default(now())
+}
+
+model Disposition {
+  id          String            @id @default(cuid())
+  closingId   String
+  closing     CashClosing       @relation(fields: [closingId], references: [id])
+  kind        DispositionKind
+  amountCents Int
+  status      DispositionStatus @default(PENDING)
+  receipts    FinanceReceipt[]
+  createdAt   DateTime          @default(now())
+}
+
+model FinanceReceipt {
+  id            String         @id @default(cuid())
+  receiptNo     String         @unique // 幂等键：重复财务回执不得重复处理/重复冲销
+  dispositionId String
+  disposition   Disposition    @relation(fields: [dispositionId], references: [id])
+  action        ReceiptAction
+  amountCents   Int
+  createdAt     DateTime       @default(now())
+}
+
+model LedgerEntry {
+  id             String      @id @default(cuid())
+  businessDayId  String // 归属营业日：跨日调整记在原营业日
+  businessDay    BusinessDay @relation(fields: [businessDayId], references: [id])
+  closingId      String?
+  closing        CashClosing? @relation(fields: [closingId], references: [id])
+  dispositionId  String?
+  adjustmentId   String?
+  kind           LedgerKind
+  amountCents    Int // 有符号金额
+  idempotencyKey String      @unique // 并发/重试防重复入账
+  createdAt      DateTime    @default(now())
+}
